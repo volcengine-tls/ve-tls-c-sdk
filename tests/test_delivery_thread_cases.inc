@@ -2,6 +2,9 @@
  * test_basic.c after its internal test fixtures, so it may use the internal
  * producer/queue types only to build a deterministic allocator fixture. */
 
+#include <pthread.h>
+#include <time.h>
+
 #define TLS_THREAD_MAX_SCHEDULED 64
 
 typedef enum {
@@ -28,6 +31,8 @@ typedef struct tls_thread_state {
     int oom_fixture_error;
     int credential_test_clock;
     int oom_hit;
+    pthread_t sender_thread;
+    int sender_thread_valid;
     ve_tls_result result;
     ve_tls_result callback_v1_result;
     ve_tls_delivery_diagnostic_reason terminal_reason;
@@ -145,6 +150,7 @@ static void tls_thread_reset_observations(tls_thread_state * state) {
     state->provider_calls = 0;
     state->schema_error = 0;
     state->oom_fixture_error = 0;
+    state->sender_thread_valid = 0;
     state->result = VE_TLS_INVALID;
     state->callback_v1_result = VE_TLS_INVALID;
     state->terminal_reason = VE_TLS_DELIVERY_DIAGNOSTIC_REASON_NONE;
@@ -197,6 +203,8 @@ static void tls_thread_diagnostic(
     } else if (event->event == VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_RETAINED) {
         state->retained_count++;
         state->retained_disposition = event->disposition;
+        state->sender_thread = pthread_self();
+        state->sender_thread_valid = 1;
     } else if (event->event == VE_TLS_DELIVERY_DIAGNOSTIC_BATCH_TERMINAL) {
         state->terminal_count++;
         state->terminal_reason = event->reason;
@@ -789,6 +797,334 @@ done:
     return rc;
 }
 
+typedef struct tls_thread_close_gate {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    ve_tls_platform * real_platform;
+    _Atomic(ve_tls_producer *) producer;
+    pthread_t sender_thread;
+    int sender_thread_valid;
+    int armed;
+    int entered;
+    int closing_seen;
+    int released;
+    int sender_waiting;
+    int pause_sender_wait;
+    int release_sender_wait;
+} tls_thread_close_gate;
+
+typedef struct tls_thread_close_arg {
+    ve_tls_producer * producer;
+    ve_tls_result result;
+} tls_thread_close_arg;
+
+static tls_thread_close_gate * g_tls_thread_close_gate;
+
+static int tls_thread_close_path_is_lease(const char * path) {
+    static const char suffix[] = "/lease";
+    size_t path_size;
+    if (!path) return 0;
+    path_size = strlen(path);
+    return path_size >= sizeof(suffix) - 1 &&
+        strcmp(path + path_size - (sizeof(suffix) - 1), suffix) == 0;
+}
+
+static void tls_thread_close_gate_deadline(int64_t timeout_ms, struct timespec * deadline) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) {
+        memset(deadline, 0, sizeof(*deadline));
+        return;
+    }
+    deadline->tv_sec = now.tv_sec + (time_t)(timeout_ms / 1000);
+    deadline->tv_nsec = now.tv_nsec + (long)((timeout_ms % 1000) * 1000000);
+    if (deadline->tv_nsec >= 1000000000L) {
+        deadline->tv_sec++;
+        deadline->tv_nsec -= 1000000000L;
+    }
+}
+
+static int tls_thread_close_gate_wait(
+    tls_thread_close_gate * gate,
+    int wait_for_closing,
+    int64_t timeout_ms
+) {
+    struct timespec deadline;
+    int rc = 0;
+    int observed = 0;
+    if (!gate || timeout_ms < 0) return -1;
+    tls_thread_close_gate_deadline(timeout_ms, &deadline);
+    pthread_mutex_lock(&gate->mutex);
+    while (!(observed = wait_for_closing ? gate->closing_seen : gate->entered)) {
+        rc = pthread_cond_timedwait(&gate->cond, &gate->mutex, &deadline);
+        if (rc != 0) break;
+    }
+    observed = wait_for_closing ? gate->closing_seen : gate->entered;
+    pthread_mutex_unlock(&gate->mutex);
+    return observed ? 0 : -1;
+}
+
+static void tls_thread_close_gate_release(tls_thread_close_gate * gate) {
+    if (!gate) return;
+    pthread_mutex_lock(&gate->mutex);
+    gate->released = 1;
+    gate->pause_sender_wait = 0;
+    gate->release_sender_wait = 1;
+    pthread_cond_broadcast(&gate->cond);
+    pthread_mutex_unlock(&gate->mutex);
+}
+
+static int tls_thread_close_gate_wait_sender_wait(
+    tls_thread_close_gate * gate,
+    int64_t timeout_ms
+) {
+    struct timespec deadline;
+    int observed = 0;
+    if (!gate || timeout_ms < 0) return -1;
+    tls_thread_close_gate_deadline(timeout_ms, &deadline);
+    pthread_mutex_lock(&gate->mutex);
+    while (!gate->sender_waiting) {
+        if (pthread_cond_timedwait(&gate->cond, &gate->mutex, &deadline) != 0) {
+            break;
+        }
+    }
+    observed = gate->sender_waiting;
+    pthread_mutex_unlock(&gate->mutex);
+    return observed ? 0 : -1;
+}
+
+static ve_tls_file * tls_thread_close_gate_file_open(
+    const char * path,
+    int flags,
+    int mode
+) {
+    tls_thread_close_gate * gate = g_tls_thread_close_gate;
+    if (gate && tls_thread_close_path_is_lease(path) &&
+        (flags & VE_TLS_FILE_OPEN_RDONLY) != 0 &&
+        (flags & (VE_TLS_FILE_OPEN_CREATE | VE_TLS_FILE_OPEN_WRONLY | VE_TLS_FILE_OPEN_RDWR)) == 0) {
+        pthread_mutex_lock(&gate->mutex);
+        if (gate->armed && gate->sender_thread_valid &&
+            pthread_equal(pthread_self(), gate->sender_thread) && !gate->entered) {
+            gate->entered = 1;
+            pthread_cond_broadcast(&gate->cond);
+            while (!gate->released) {
+                pthread_cond_wait(&gate->cond, &gate->mutex);
+            }
+        }
+        pthread_mutex_unlock(&gate->mutex);
+    }
+    return gate && gate->real_platform && gate->real_platform->file_open
+        ? gate->real_platform->file_open(path, flags, mode)
+        : NULL;
+}
+
+static int tls_thread_close_gate_cond_timedwait_ms(
+    ve_tls_cond * cond,
+    ve_tls_mutex * mutex,
+    int64_t timeout_ms
+) {
+    tls_thread_close_gate * gate = g_tls_thread_close_gate;
+    ve_tls_producer * producer = gate
+        ? atomic_load_explicit(&gate->producer, memory_order_acquire)
+        : NULL;
+    if (gate && producer && cond == producer->send_cond) {
+        pthread_mutex_lock(&gate->mutex);
+        int sender_wait = gate->pause_sender_wait && gate->sender_thread_valid &&
+            pthread_equal(pthread_self(), gate->sender_thread);
+        if (sender_wait) {
+            if (!gate->sender_waiting) {
+                gate->sender_waiting = 1;
+                pthread_cond_broadcast(&gate->cond);
+            }
+            while (gate->pause_sender_wait && !gate->release_sender_wait) {
+                pthread_cond_wait(&gate->cond, &gate->mutex);
+            }
+            pthread_mutex_unlock(&gate->mutex);
+            /* The test gate is the wakeup; preserve the caller's locked mutex
+               and make the sender revisit its heartbeat before the real timed
+               wait. */
+            return 0;
+        }
+        pthread_mutex_unlock(&gate->mutex);
+    }
+    return gate && gate->real_platform && gate->real_platform->cond_timedwait_ms
+        ? gate->real_platform->cond_timedwait_ms(cond, mutex, timeout_ms)
+        : -1;
+}
+
+static void tls_thread_close_gate_cond_broadcast(ve_tls_cond * cond) {
+    tls_thread_close_gate * gate = g_tls_thread_close_gate;
+    ve_tls_producer * producer = gate
+        ? atomic_load_explicit(&gate->producer, memory_order_acquire)
+        : NULL;
+    int closing_seen = gate && producer && cond == producer->cond &&
+        producer->closing;
+    if (gate && gate->real_platform && gate->real_platform->cond_broadcast) {
+        gate->real_platform->cond_broadcast(cond);
+    }
+    if (closing_seen) {
+        pthread_mutex_lock(&gate->mutex);
+        gate->closing_seen = 1;
+        pthread_cond_broadcast(&gate->cond);
+        pthread_mutex_unlock(&gate->mutex);
+    }
+}
+
+static void * tls_thread_close_main(void * arg) {
+    tls_thread_close_arg * close_arg = (tls_thread_close_arg *)arg;
+    if (!close_arg || !close_arg->producer) return NULL;
+    close_arg->result = ve_tls_producer_close(close_arg->producer, 1000);
+    return NULL;
+}
+
+static int test_sender_thread_persistent_close_heartbeat_wakeup(void) {
+    tls_thread_state state;
+    ve_tls_config config;
+    ve_tls_producer * producer = NULL;
+    char dir[PATH_MAX] = {0};
+    tls_thread_close_gate gate;
+    tls_thread_close_arg close_arg;
+    ve_tls_thread * close_thread = NULL;
+    int gate_initialized = 0;
+    int gate_mutex_initialized = 0;
+    int gate_cond_initialized = 0;
+    int close_started = 0;
+    int observed = 0;
+    int stage = 0;
+    int rc = -1;
+
+    memset(&gate, 0, sizeof(gate));
+    atomic_init(&gate.producer, NULL);
+    memset(&close_arg, 0, sizeof(close_arg));
+    if (tls_thread_state_init(&state) != 0 ||
+        tls_thread_config(&config, &state, 0, 1, 60000) != 0 ||
+        make_temp_dir(dir, sizeof(dir)) != 0) {
+        tls_thread_state_destroy(&state);
+        cleanup_persistent_dir(dir);
+        return -1;
+    }
+    config.use_global_env = 0;
+    config.use_persistent = 1;
+    config.persistent_file_path = dir;
+    config.persistent_durability = VE_TLS_PDURABILITY_SYNC_WAL;
+    config.persistent_lease_timeout_ms = 60000;
+    config.persistent_heartbeat_interval_ms = 1;
+    config.max_persistent_log_count = 64;
+    config.max_persistent_file_size = 1024;
+    config.max_persistent_file_count = 4;
+    config.platform.file_open = tls_thread_close_gate_file_open;
+    config.platform.cond_timedwait_ms = tls_thread_close_gate_cond_timedwait_ms;
+    config.platform.cond_broadcast = tls_thread_close_gate_cond_broadcast;
+    state.http_mode = TLS_THREAD_HTTP_RETRY;
+    state.http_sleep_ms = 0;
+    state.http_success = 0;
+    stage = 1;
+
+    if (pthread_mutex_init(&gate.mutex, NULL) != 0) {
+        goto done;
+    }
+    gate_mutex_initialized = 1;
+    if (pthread_cond_init(&gate.cond, NULL) != 0) {
+        goto done;
+    }
+    gate_cond_initialized = 1;
+    gate_initialized = 1;
+    stage = 2;
+    gate.real_platform = &state.platform;
+    g_tls_thread_close_gate = &gate;
+    producer = tls_thread_open(&config, &state);
+    if (!producer || tls_thread_add_one(producer) != 0 ||
+        tls_thread_wait(&state, tls_thread_pred_retained, 1500) != 0) {
+        goto done;
+    }
+    stage = 3;
+    state.platform.mutex_lock(state.mutex);
+    gate.sender_thread = state.sender_thread;
+    gate.sender_thread_valid = state.sender_thread_valid;
+    state.platform.mutex_unlock(state.mutex);
+    atomic_store_explicit(&gate.producer, producer, memory_order_release);
+    state.platform.mutex_lock(producer->mutex);
+    pthread_mutex_lock(&gate.mutex);
+    gate.pause_sender_wait = 1;
+    pthread_mutex_unlock(&gate.mutex);
+    /* Pair the wakeup with the producer mutex so it cannot race the sender's
+       transition into its real timed wait. */
+    state.platform.cond_broadcast(producer->send_cond);
+    state.platform.mutex_unlock(producer->mutex);
+    if (tls_thread_close_gate_wait_sender_wait(&gate, 2000) != 0) {
+        goto done;
+    }
+    pthread_mutex_lock(&gate.mutex);
+    /* The sender is paused before returning from its retry wait. Make the next
+       heartbeat due only now, after any earlier heartbeat has completed. */
+    atomic_store_explicit(
+        &producer->persistent->next_heartbeat_ms,
+        0,
+        memory_order_relaxed);
+    gate.armed = 1;
+    gate.pause_sender_wait = 0;
+    gate.release_sender_wait = 1;
+    pthread_cond_broadcast(&gate.cond);
+    pthread_mutex_unlock(&gate.mutex);
+    if (tls_thread_close_gate_wait(&gate, 0, 2000) != 0) {
+        goto done;
+    }
+    stage = 4;
+
+    close_arg.producer = producer;
+    close_arg.result = VE_TLS_INVALID;
+    close_thread = state.platform.thread_create(tls_thread_close_main, &close_arg);
+    if (!close_thread) goto done;
+    close_started = 1;
+    stage = 5;
+    if (tls_thread_close_gate_wait(&gate, 1, 1000) != 0) {
+        goto done;
+    }
+    stage = 6;
+    tls_thread_close_gate_release(&gate);
+    state.platform.thread_join(close_thread);
+    close_thread = NULL;
+    observed = 1;
+    rc = close_arg.result == VE_TLS_OK && state.request_count == 1 &&
+        state.callback_count == 0 && state.terminal_count == 0 &&
+        state.retained_disposition == VE_TLS_DELIVERY_DIAGNOSTIC_DISPOSITION_RETAINED_WAL
+        ? 0 : -2;
+
+done:
+    if (gate_initialized) {
+        tls_thread_close_gate_release(&gate);
+    }
+    if (close_thread) {
+        state.platform.thread_join(close_thread);
+        close_thread = NULL;
+    }
+    if (producer) {
+        if (!close_started) {
+            (void)ve_tls_producer_close(producer, 1000);
+        }
+        ve_tls_producer_destroy(producer);
+        producer = NULL;
+    }
+    atomic_store_explicit(&gate.producer, NULL, memory_order_release);
+    g_tls_thread_close_gate = NULL;
+    if (gate_cond_initialized) {
+        pthread_cond_destroy(&gate.cond);
+    }
+    if (gate_mutex_initialized) {
+        pthread_mutex_destroy(&gate.mutex);
+    }
+    if (rc != 0) {
+        fprintf(stderr,
+            "close heartbeat wakeup: stage=%d gate=%d/%d/%d released=%d close_started=%d close_rc=%d requests=%d retained=%d callbacks=%d terminal=%d\n",
+            stage, gate.entered, gate.closing_seen, gate.armed, gate.released,
+            close_started, close_arg.result, state.request_count,
+            state.retained_count, state.callback_count, state.terminal_count);
+    }
+    if (!observed && rc == 0) rc = -1;
+    tls_thread_state_destroy(&state);
+    cleanup_persistent_dir(dir);
+    return rc;
+}
+
 static int test_sender_thread_persistent_close_preserves_wal(void) {
     tls_thread_state state;
     ve_tls_config config;
@@ -829,6 +1165,20 @@ static int test_sender_thread_persistent_close_preserves_wal(void) {
         goto done;
     }
     p1_close_rc = (int)ve_tls_producer_close(producer, 3000);
+    if (p1_close_rc != VE_TLS_OK) {
+        producer->config.platform.mutex_lock(producer->mutex);
+        fprintf(stderr, "close pending: queue=%zu ingress=%zu worker=%d append=%d fast=%lld sendq=%zu\n",
+            producer->queue_count, producer->ingress_queue_count, producer->worker_flushing_count,
+            producer->active_persistent_appends, (long long)producer->fast_inflight, producer->send_queue.count);
+        for (size_t i = 0; i < producer->key_bucket_count; i++) {
+            for (ve_tls_key_queue * q = producer->key_buckets[i]; q; q = q->hnext) {
+                fprintf(stderr, "close key: count=%zu inflight=%d delayed=%d ready=%lld cycle=%u\n",
+                    q->count, q->inflight, q->delayed, (long long)q->next_ready_ms,
+                    q->count ? q->q[q->head].persistent_retry_cycle : 0);
+            }
+        }
+        producer->config.platform.mutex_unlock(producer->mutex);
+    }
     p1_checkpoint = test_producer_checkpoint_acked_log_id(producer);
     observed_p1 = 1;
     if (producer) ve_tls_producer_destroy(producer);

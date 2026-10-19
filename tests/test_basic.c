@@ -25,6 +25,10 @@
 #include <limits.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <pthread.h>
+#include <errno.h>
+#include <time.h>
 
 #if defined(VE_TLS_HAVE_ZLIB)
 #include <zlib.h>
@@ -689,6 +693,8 @@ static int test_fake_cond_timedwait_ms(ve_tls_cond * c, ve_tls_mutex * m, int64_
 
 static char g_track_dir[PATH_MAX];
 static int g_track_lease_opens = 0;
+static int g_track_lease_temp_opens = 0;
+static int g_track_lease_renames = 0;
 static int g_track_checkpoint_opens = 0;
 static int g_track_segment_opens = 0;
 static int g_track_segment_stats = 0;
@@ -698,6 +704,12 @@ static int g_track_file_write_saw_producer_mutex = 0;
 static int g_block_lease_rename = 0;
 static int g_lease_rename_entered = 0;
 static int g_release_lease_rename = 0;
+static pthread_mutex_t g_lease_rename_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_lease_rename_gate_cond = PTHREAD_COND_INITIALIZER;
+static ve_tls_mutex * g_observe_persistent_mutex = NULL;
+static pthread_mutex_t g_observe_persistent_event_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_observe_persistent_event_cond = PTHREAD_COND_INITIALIZER;
+static int g_observe_persistent_lock = 0;
 static int g_fail_next_path_rename = 0;
 static int g_fail_next_file_fsync = 0;
 static int g_file_fsync_calls = 0;
@@ -734,12 +746,42 @@ static int test_blocking_lease_path_rename(const char * from, const char * to) {
     size_t length = to ? strlen(to) : 0;
     if (__atomic_load_n(&g_block_lease_rename, __ATOMIC_ACQUIRE) &&
         length >= 6 && strcmp(to + length - 6, "/lease") == 0) {
+        pthread_mutex_lock(&g_lease_rename_gate_mutex);
         __atomic_store_n(&g_lease_rename_entered, 1, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&g_lease_rename_gate_cond);
         while (!__atomic_load_n(&g_release_lease_rename, __ATOMIC_ACQUIRE)) {
-            g_real_platform.sleep_ms(1);
+            pthread_cond_wait(&g_lease_rename_gate_cond, &g_lease_rename_gate_mutex);
         }
+        pthread_mutex_unlock(&g_lease_rename_gate_mutex);
     }
     return g_real_platform.path_rename(from, to);
+}
+
+static int test_wait_lease_rename_entered(void) {
+    int entered;
+    pthread_mutex_lock(&g_lease_rename_gate_mutex);
+    while (!__atomic_load_n(&g_lease_rename_entered, __ATOMIC_ACQUIRE)) {
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            pthread_mutex_unlock(&g_lease_rename_gate_mutex);
+            return -1;
+        }
+        deadline.tv_sec += 3;
+        if (pthread_cond_timedwait(&g_lease_rename_gate_cond, &g_lease_rename_gate_mutex, &deadline) == ETIMEDOUT) {
+            pthread_mutex_unlock(&g_lease_rename_gate_mutex);
+            return -1;
+        }
+    }
+    entered = __atomic_load_n(&g_lease_rename_entered, __ATOMIC_ACQUIRE);
+    pthread_mutex_unlock(&g_lease_rename_gate_mutex);
+    return entered ? 0 : -1;
+}
+
+static void test_release_lease_rename_gate(void) {
+    pthread_mutex_lock(&g_lease_rename_gate_mutex);
+    __atomic_store_n(&g_release_lease_rename, 1, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&g_lease_rename_gate_cond);
+    pthread_mutex_unlock(&g_lease_rename_gate_mutex);
 }
 
 static int test_fail_next_path_rename(const char * from, const char * to) {
@@ -759,6 +801,10 @@ static int test_path_is_tracked_lease(const char * path) {
     return n >= sizeof(suffix) - 1 && strcmp(path + n - (sizeof(suffix) - 1), suffix) == 0;
 }
 
+static int test_path_is_tracked_lease_temp(const char * path) {
+    return test_path_in_tracked_dir(path) && strstr(path, "/lease.tmp.") != NULL;
+}
+
 static int test_path_is_tracked_checkpoint(const char * path) {
     size_t n;
     static const char suffix[] = "/checkpoint";
@@ -775,6 +821,8 @@ static int test_path_is_tracked_segment(const char * path) {
 
 static void test_track_reset(const char * dir) {
     g_track_lease_opens = 0;
+    g_track_lease_temp_opens = 0;
+    g_track_lease_renames = 0;
     g_track_checkpoint_opens = 0;
     g_track_segment_opens = 0;
     g_track_segment_stats = 0;
@@ -789,6 +837,9 @@ static ve_tls_file * test_track_file_open(const char * path, int flags, int mode
     if (test_path_is_tracked_lease(path)) {
         g_track_lease_opens++;
     }
+    if (test_path_is_tracked_lease_temp(path)) {
+        g_track_lease_temp_opens++;
+    }
     if (test_path_is_tracked_checkpoint(path)) {
         g_track_checkpoint_opens++;
     }
@@ -796,6 +847,13 @@ static ve_tls_file * test_track_file_open(const char * path, int flags, int mode
         g_track_segment_opens++;
     }
     return g_real_platform.file_open(path, flags, mode);
+}
+
+static int test_track_path_rename(const char * from, const char * to) {
+    if (test_path_is_tracked_lease(to)) {
+        g_track_lease_renames++;
+    }
+    return g_real_platform.path_rename(from, to);
 }
 
 static int test_track_path_stat(const char * path, ve_tls_path_info * info) {
@@ -818,6 +876,34 @@ static void test_track_mutex_lock(ve_tls_mutex * m) {
     if (m == __atomic_load_n(&g_track_producer_mutex, __ATOMIC_ACQUIRE)) {
         g_track_producer_mutex_depth++;
     }
+    if (m == __atomic_load_n(&g_observe_persistent_mutex, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_lock(&g_observe_persistent_event_mutex);
+        g_observe_persistent_lock = 1;
+        pthread_cond_broadcast(&g_observe_persistent_event_cond);
+        pthread_mutex_unlock(&g_observe_persistent_event_mutex);
+    }
+}
+
+static int test_wait_observed_persistent_lock(void) {
+    int rc = 0;
+    pthread_mutex_lock(&g_observe_persistent_event_mutex);
+    while (!g_observe_persistent_lock) {
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            rc = -1;
+            break;
+        }
+        deadline.tv_sec += 3;
+        if (pthread_cond_timedwait(
+                &g_observe_persistent_event_cond,
+                &g_observe_persistent_event_mutex,
+                &deadline) == ETIMEDOUT) {
+            rc = -1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_observe_persistent_event_mutex);
+    return rc;
 }
 
 static void test_track_mutex_unlock(ve_tls_mutex * m) {
@@ -10919,6 +11005,52 @@ static int test_http_sleep_do(ve_tls_http_client * client, const ve_tls_http_req
 }
 
 static int g_takeover_http_started = 0;
+static pthread_t g_takeover_main_thread;
+static int g_takeover_time_frozen = 0;
+static pthread_mutex_t g_takeover_http_gate_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_takeover_http_gate_cond = PTHREAD_COND_INITIALIZER;
+static int g_takeover_http_released = 0;
+
+static int64_t test_takeover_time_ms(void) {
+    if (g_takeover_time_frozen && pthread_equal(pthread_self(), g_takeover_main_thread)) {
+        return g_fake_time;
+    }
+    return 1000;
+}
+
+static void test_takeover_http_reset(void) {
+    pthread_mutex_lock(&g_takeover_http_gate_mutex);
+    g_takeover_http_released = 0;
+    g_takeover_http_started = 0;
+    pthread_mutex_unlock(&g_takeover_http_gate_mutex);
+}
+
+static int test_takeover_http_wait_started(void) {
+    int rc = 0;
+    pthread_mutex_lock(&g_takeover_http_gate_mutex);
+    while (!g_takeover_http_started) {
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            rc = -1;
+            break;
+        }
+        deadline.tv_sec += 3;
+        if (pthread_cond_timedwait(&g_takeover_http_gate_cond,
+                &g_takeover_http_gate_mutex, &deadline) == ETIMEDOUT) {
+            rc = -1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_takeover_http_gate_mutex);
+    return rc;
+}
+
+static void test_takeover_http_release(void) {
+    pthread_mutex_lock(&g_takeover_http_gate_mutex);
+    g_takeover_http_released = 1;
+    pthread_cond_broadcast(&g_takeover_http_gate_cond);
+    pthread_mutex_unlock(&g_takeover_http_gate_mutex);
+}
 
 static int test_http_takeover_block_do(ve_tls_http_client * client, const ve_tls_http_request * req, ve_tls_http_response * resp) {
     (void)client;
@@ -10926,8 +11058,13 @@ static int test_http_takeover_block_do(ve_tls_http_client * client, const ve_tls
     if (!resp) {
         return -1;
     }
-    __atomic_store_n(&g_takeover_http_started, 1, __ATOMIC_RELEASE);
-    usleep(500 * 1000);
+    pthread_mutex_lock(&g_takeover_http_gate_mutex);
+    g_takeover_http_started = 1;
+    pthread_cond_broadcast(&g_takeover_http_gate_cond);
+    while (!g_takeover_http_released) {
+        pthread_cond_wait(&g_takeover_http_gate_cond, &g_takeover_http_gate_mutex);
+    }
+    pthread_mutex_unlock(&g_takeover_http_gate_mutex);
     resp->status_code = 200;
     resp->request_id = strdup("rid-takeover");
     return 0;
@@ -12045,7 +12182,8 @@ static void cleanup_persistent_dir(const char * dir) {
         "manifest",
         "manifest.tmp",
         "checkpoint",
-        "lease"
+        "lease",
+        "lease.lock"
     };
     if (!dir || dir[0] == 0) {
         return;
@@ -12059,6 +12197,20 @@ static void cleanup_persistent_dir(const char * dir) {
         snprintf(name, sizeof(name), "seg-%06u.log", segment_id);
         join_path(path, sizeof(path), dir, name);
         unlink(path);
+    }
+    {
+        DIR * entries = opendir(dir);
+        struct dirent * entry;
+        if (entries) {
+            while ((entry = readdir(entries)) != NULL) {
+                if (strncmp(entry->d_name, "lease.tmp.", strlen("lease.tmp.")) == 0 ||
+                    strncmp(entry->d_name, "manifest.tmp.", strlen("manifest.tmp.")) == 0) {
+                    join_path(path, sizeof(path), dir, entry->d_name);
+                    unlink(path);
+                }
+            }
+            closedir(entries);
+        }
     }
     rmdir(dir);
 }
@@ -15243,7 +15395,7 @@ static int test_persistent_mutation_rejects_invalid_clock_without_lease_write(vo
     return failed ? -1 : 0;
 }
 
-static int test_persistent_heartbeat_before_due_skips_lease_reload(void) {
+static int test_persistent_heartbeat_before_due_validates_without_renewal(void) {
     char dir[PATH_MAX];
     ve_tls_persistent_options opt;
     ve_tls_persistent persistent;
@@ -15257,6 +15409,7 @@ static int test_persistent_heartbeat_before_due_skips_lease_reload(void) {
     cfg.platform.time_ms = test_fake_time_ms;
     cfg.platform.sleep_ms = test_fake_sleep_ms;
     cfg.platform.file_open = test_track_file_open;
+    cfg.platform.path_rename = test_track_path_rename;
     memset(&opt, 0, sizeof(opt));
     memset(&persistent, 0, sizeof(persistent));
     test_track_reset(dir);
@@ -15280,7 +15433,9 @@ static int test_persistent_heartbeat_before_due_skips_lease_reload(void) {
         return -1;
     }
     test_track_reset(dir);
-    if (ve_tls_persistent_heartbeat_if_due(&persistent, 0) != 0 || g_track_lease_opens != 0) {
+    if (ve_tls_persistent_heartbeat_if_due(&persistent, 0) != 0 ||
+        g_track_lease_opens < 1 || g_track_lease_temp_opens != 0 ||
+        g_track_lease_renames != 0) {
         ve_tls_persistent_close(&persistent);
         cleanup_persistent_dir(dir);
         return -1;
@@ -15290,7 +15445,7 @@ static int test_persistent_heartbeat_before_due_skips_lease_reload(void) {
     return 0;
 }
 
-static int test_persistent_append_before_due_skips_lease_reload(void) {
+static int test_persistent_append_before_due_validates_without_renewal(void) {
     char dir[PATH_MAX];
     ve_tls_persistent_options opt;
     ve_tls_persistent persistent;
@@ -15305,6 +15460,7 @@ static int test_persistent_append_before_due_skips_lease_reload(void) {
     cfg.platform.time_ms = test_fake_time_ms;
     cfg.platform.sleep_ms = test_fake_sleep_ms;
     cfg.platform.file_open = test_track_file_open;
+    cfg.platform.path_rename = test_track_path_rename;
     memset(&opt, 0, sizeof(opt));
     memset(&persistent, 0, sizeof(persistent));
     test_track_reset(dir);
@@ -15329,7 +15485,8 @@ static int test_persistent_append_before_due_skips_lease_reload(void) {
     }
     test_track_reset(dir);
     if (ve_tls_persistent_append(&persistent, 1, NULL, payload, sizeof(payload) - 1) != 0 ||
-        g_track_lease_opens != 0) {
+        g_track_lease_opens < 1 || g_track_lease_temp_opens != 0 ||
+        g_track_lease_renames != 0) {
         ve_tls_persistent_close(&persistent);
         cleanup_persistent_dir(dir);
         return -1;
@@ -15339,7 +15496,7 @@ static int test_persistent_append_before_due_skips_lease_reload(void) {
     return 0;
 }
 
-static int test_persistent_append_after_heartbeat_due_uses_valid_lease_window(void) {
+static int test_persistent_append_after_heartbeat_due_validates_without_renewal(void) {
     char dir[PATH_MAX];
     ve_tls_persistent_options opt;
     ve_tls_persistent persistent;
@@ -15354,6 +15511,7 @@ static int test_persistent_append_after_heartbeat_due_uses_valid_lease_window(vo
     cfg.platform.time_ms = test_fake_time_ms;
     cfg.platform.sleep_ms = test_fake_sleep_ms;
     cfg.platform.file_open = test_track_file_open;
+    cfg.platform.path_rename = test_track_path_rename;
     memset(&opt, 0, sizeof(opt));
     memset(&persistent, 0, sizeof(persistent));
     test_track_reset(dir);
@@ -15379,7 +15537,8 @@ static int test_persistent_append_after_heartbeat_due_uses_valid_lease_window(vo
     g_fake_time = 1101;
     test_track_reset(dir);
     if (ve_tls_persistent_append(&persistent, 1, NULL, payload, sizeof(payload) - 1) != 0 ||
-        g_track_lease_opens != 0) {
+        g_track_lease_opens < 1 || g_track_lease_temp_opens != 0 ||
+        g_track_lease_renames != 0) {
         ve_tls_persistent_close(&persistent);
         cleanup_persistent_dir(dir);
         return -1;
@@ -16996,7 +17155,7 @@ static void * heartbeat_append_thread(void * arg) {
     return NULL;
 }
 
-static int test_blocked_background_heartbeat_does_not_block_append(void) {
+static int test_blocked_background_heartbeat_blocks_append_until_release(void) {
     char dir[PATH_MAX];
     ve_tls_config cfg;
     ve_tls_producer * producer = NULL;
@@ -17014,6 +17173,10 @@ static int test_blocked_background_heartbeat_does_not_block_append(void) {
     }
     g_real_platform = cfg.platform;
     cfg.platform.path_rename = test_blocking_lease_path_rename;
+    cfg.platform.mutex_create = test_track_mutex_create;
+    cfg.platform.mutex_destroy = test_track_mutex_destroy;
+    cfg.platform.mutex_lock = test_track_mutex_lock;
+    cfg.platform.mutex_unlock = test_track_mutex_unlock;
     cfg.endpoint = "https://example.com";
     cfg.region = "cn-beijing";
     cfg.topic_id = "heartbeat-concurrency";
@@ -17042,11 +17205,12 @@ static int test_blocked_background_heartbeat_does_not_block_append(void) {
     __atomic_store_n(&g_lease_rename_entered, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_release_lease_rename, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&g_block_lease_rename, 1, __ATOMIC_RELEASE);
-    for (int i = 0; i < 500 &&
-            !__atomic_load_n(&g_lease_rename_entered, __ATOMIC_ACQUIRE); i++) {
-        cfg.platform.sleep_ms(1);
-    }
-    if (!__atomic_load_n(&g_lease_rename_entered, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&g_track_producer_mutex, producer->persistent_mutex, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_observe_persistent_mutex, producer->persistent_mutex, __ATOMIC_RELEASE);
+    pthread_mutex_lock(&g_observe_persistent_event_mutex);
+    g_observe_persistent_lock = 0;
+    pthread_mutex_unlock(&g_observe_persistent_event_mutex);
+    if (test_wait_lease_rename_entered() != 0) {
         failed = 1;
         goto done;
     }
@@ -17055,19 +17219,21 @@ static int test_blocked_background_heartbeat_does_not_block_append(void) {
         failed = 1;
         goto done;
     }
-    for (int i = 0; i < 200 &&
-            !__atomic_load_n(&append_state.completed, __ATOMIC_ACQUIRE); i++) {
-        cfg.platform.sleep_ms(1);
+    if (test_wait_observed_persistent_lock() != 0) {
+        failed = 1;
+        goto done;
     }
     completed_before_release = __atomic_load_n(&append_state.completed, __ATOMIC_ACQUIRE);
 
 done:
-    __atomic_store_n(&g_release_lease_rename, 1, __ATOMIC_RELEASE);
+    test_release_lease_rename_gate();
     __atomic_store_n(&g_block_lease_rename, 0, __ATOMIC_RELEASE);
     if (append_thread) {
         cfg.platform.thread_join(append_thread);
     }
-    failed = failed || !completed_before_release ||
+    __atomic_store_n(&g_observe_persistent_mutex, NULL, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_track_producer_mutex, NULL, __ATOMIC_RELEASE);
+    failed = failed || completed_before_release ||
         append_state.result != VE_TLS_OK;
     ve_tls_producer_destroy(producer);
     cleanup_persistent_dir(dir);
@@ -17552,17 +17718,20 @@ static int test_producer_takeover_recovers_and_invalidates_old_writer(void) {
     unsigned char * buf = NULL;
     size_t size = 0;
     uint32_t count = 0;
+    int failed = 0;
     if (make_temp_dir(dir, sizeof(dir)) != 0) {
         return -1;
     }
     if (ve_tls_config_init_versioned(
             &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT) != VE_TLS_OK) {
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
     g_real_platform = cfg.platform;
     g_fake_time = 1000;
-    cfg.platform.time_ms = test_fake_time_ms;
+    g_takeover_main_thread = pthread_self();
+    g_takeover_time_frozen = 1;
+    cfg.platform.time_ms = test_takeover_time_ms;
     cfg.endpoint = "https://example.com";
     cfg.region = "cn-beijing";
     cfg.topic_id = "t";
@@ -17582,67 +17751,63 @@ static int test_producer_takeover_recovers_and_invalidates_old_writer(void) {
     cfg.persistent_open_mode = VE_TLS_POPEN_TAKEOVER_IF_STALE;
     cfg.http_client.do_request = test_http_takeover_block_do;
     cfg.http_client.free_response = test_http_sleep_free;
-    __atomic_store_n(&g_takeover_http_started, 0, __ATOMIC_RELEASE);
+    test_takeover_http_reset();
 
     p1 = ve_tls_producer_create_versioned(
         &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
     if (!p1 || !p1->persistent) {
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
     if (ve_tls_producer_add_log_raw(p1, "{\"a\":1}", strlen("{\"a\":1}"), 1) != VE_TLS_OK) {
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
-    for (int i = 0; i < 500 &&
-            !__atomic_load_n(&g_takeover_http_started, __ATOMIC_ACQUIRE); i++) {
-        cfg.platform.sleep_ms(1);
-    }
-    if (!__atomic_load_n(&g_takeover_http_started, __ATOMIC_ACQUIRE)) {
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+    if (test_takeover_http_wait_started() != 0) {
+        failed = 1;
+        goto done;
     }
     g_fake_time = 1100;
 
     p2 = ve_tls_producer_create_versioned(
         &cfg, sizeof(cfg), VE_TLS_CONFIG_VERSION_CURRENT);
     if (!p2 || !p2->persistent) {
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
     if (ve_tls_producer_recover(p2) != VE_TLS_OK) {
-        ve_tls_producer_destroy(p2);
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
     if (ve_tls_producer_export_raw_buffer(p2, &buf, &size) != VE_TLS_OK) {
-        ve_tls_producer_destroy(p2);
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
     if (exported_buffer_count_and_first_hash_key(buf, size, &count, NULL, 0) != 0 || count != 1) {
-        ve_tls_producer_free_raw_buffer(buf);
-        ve_tls_producer_destroy(p2);
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
     ve_tls_producer_free_raw_buffer(buf);
+    buf = NULL;
     if (ve_tls_producer_add_log_raw(p1, "{\"b\":2}", strlen("{\"b\":2}"), 0) == VE_TLS_OK) {
-        ve_tls_producer_destroy(p2);
-        ve_tls_producer_destroy(p1);
-        cleanup_persistent_dir(dir);
-        return -1;
+        failed = 1;
+        goto done;
     }
-    ve_tls_producer_destroy(p2);
-    ve_tls_producer_destroy(p1);
+done:
+    if (buf) {
+        ve_tls_producer_free_raw_buffer(buf);
+    }
+    /* Release the blocked sender before destroying either producer. */
+    test_takeover_http_release();
+    if (p2) {
+        ve_tls_producer_destroy(p2);
+    }
+    if (p1) {
+        ve_tls_producer_destroy(p1);
+    }
+    g_takeover_time_frozen = 0;
     cleanup_persistent_dir(dir);
-    return 0;
+    return failed ? -1 : 0;
 }
 
 /* === BEGIN coverage-uplift tests (TDD Guide) === */
@@ -19836,6 +20001,7 @@ static int t_p9_global_env_create(void) {
 #include "test_persistent_reader_regressions.inc"
 #include "test_delivery_thread_cases.inc"
 #include "test_config_version_contract.inc"
+#include "test_lease_fencing_regressions.inc"
 
 int main(void) {
     int rc = 0;
@@ -19846,6 +20012,24 @@ int main(void) {
     RUN(2002, test_builder_sign_regressions());
     RUN(2003, test_producer_admission_regressions());
     RUN(2004, test_persistent_reader_regressions());
+    RUN(1501, test_lease_fencing_heartbeat_gate());
+    RUN(1502, test_lease_fencing_append_gate());
+    RUN(1503, test_lease_fencing_close_gate());
+    RUN(1504, test_lease_fencing_same_process_one_winner());
+    RUN(1505, test_lease_fencing_fork_kill_releases_guard());
+    RUN(1506, test_lease_fencing_recover_callback_reentry());
+    RUN(1507, test_lease_fencing_guard_error_paths());
+    RUN(1530, test_exclusive_persistence_factory_contract());
+    RUN(1531, test_exclusive_persistence_lifetime_takeover());
+    RUN(1532, test_exclusive_persistence_hot_path_recovery());
+    RUN(1533, test_exclusive_persistence_concurrent_append_recovery());
+    RUN(1534, test_exclusive_persistence_recovery_reentry());
+    RUN(1535, test_exclusive_persistence_fork_close_preserves_lock());
+    RUN(1508, test_producer_aba_owner_identity());
+    RUN(1509, test_lease_owner_identity_helper());
+    RUN(1510, test_lease_fencing_persistent_shared_fd());
+    RUN(1511, test_lease_fencing_persistent_fork_fd());
+    RUN(1512, test_lease_fencing_persistent_fd_lifecycle());
     RUN(1, test_sha256());
     RUN(2, test_proto());
     RUN(3, test_proto_log_group_list_multi_groups());
@@ -20081,9 +20265,9 @@ int main(void) {
     RUN(335, test_persistent_heartbeat_fsync_matches_durability());
     RUN(343, test_persistent_open_rejects_invalid_lease_clock_config());
     RUN(344, test_persistent_mutation_rejects_invalid_clock_without_lease_write());
-    RUN(148, test_persistent_heartbeat_before_due_skips_lease_reload());
-    RUN(159, test_persistent_append_before_due_skips_lease_reload());
-    RUN(336, test_persistent_append_after_heartbeat_due_uses_valid_lease_window());
+    RUN(148, test_persistent_heartbeat_before_due_validates_without_renewal());
+    RUN(159, test_persistent_append_before_due_validates_without_renewal());
+    RUN(336, test_persistent_append_after_heartbeat_due_validates_without_renewal());
     RUN(341, test_persistent_failed_heartbeat_uses_bounded_retry());
     RUN(137, test_persistent_takeover_invalidates_old_writer());
     RUN(149, test_persistent_ack_range_reclaims_without_rescanning_segments());
@@ -20096,6 +20280,7 @@ int main(void) {
     RUN(192, test_persistent_high_watermark_preserves_and_revisits_replay_segment());
     RUN(193, test_persistent_watermark_config_validation());
     RUN(340, test_persistent_lease_config_validation());
+    RUN(345, test_sender_thread_persistent_close_heartbeat_wakeup());
     RUN(194, test_persistent_drop_newest_sample_never_deletes_old_wal());
     RUN(195, test_persistent_ack_range_rejects_hole());
     RUN(197, test_persistent_concurrent_append_ack_and_reclaim());
@@ -20110,7 +20295,7 @@ int main(void) {
     RUN(144, test_persistent_kv_path_batches_multiple_logs_into_single_request());
     RUN(150, test_persistent_append_releases_producer_mutex_for_disk_write());
     RUN(339, test_background_heartbeat_does_not_hold_persistent_mutex());
-    RUN(342, test_blocked_background_heartbeat_does_not_block_append());
+    RUN(342, test_blocked_background_heartbeat_blocks_append_until_release());
     RUN(322, test_persistent_ordered_add_avoids_secondary_ingress_allocation());
     RUN(324, test_persistent_ordered_add_reuses_single_log_builder());
     RUN(325, test_log_builder_shrink_releases_large_allocation_safely());
